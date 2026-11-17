@@ -719,6 +719,12 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
         "profile": config.runtime.profile_schedule_enabled or None,
         "skill": None,
     }
+    # A count threshold starts a Family as soon as enough new Source entries
+    # wait behind its cursor, beside the time condition above.
+    count_thresholds = {
+        "memory": config.runtime.memory_source_count_threshold,
+        "topic-memory": config.runtime.topic_memory_source_count_threshold,
+    }
     for family, schedule in automatic.items():
         if schedule is not None and family not in declared | registered:
             if (
@@ -771,6 +777,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
             entrypoint = partial(run_family_worker, FamilyWorkerSpec(config=config, worker_security=worker_security))
         interval = None if family == "profile" else automatic[family]
         binding = canonical[family]
+        count_threshold = count_thresholds.get(family)
         configured.append(
             ArtifactProcessingBinding(
                 binding_name=binding,
@@ -783,9 +790,10 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 if family == "profile" and config.runtime.profile_schedule_enabled
                 else None,
                 timezone=config.runtime.profile_timezone if family == "profile" else "Asia/Shanghai",
+                automatic_count_threshold=count_threshold,
                 pending_provider=None
                 if family == "skill"
-                else SourceProcessingPendingProvider(contexts.database, binding, family),
+                else SourceProcessingPendingProvider(contexts.database, binding, family, count_threshold),
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
             )
         )

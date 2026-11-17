@@ -24,6 +24,7 @@ from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.supervision import ArtifactProcessingFence, ArtifactProcessingLeaseRepository
 from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.runtime.source_count_trigger import request_count_triggered_processing
 
 
 async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[str, ...]) -> frozenset[str]:
@@ -48,10 +49,17 @@ async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[s
 class SourceProcessingPendingProvider:
     """Inspect journal metadata, never Source bodies, prompts, or models."""
 
-    def __init__(self, database: AsyncDatabase, binding_name: str, artifact_family: str) -> None:
+    def __init__(
+        self,
+        database: AsyncDatabase,
+        binding_name: str,
+        artifact_family: str,
+        count_threshold: int | None = None,
+    ) -> None:
         self._database = database
         self._binding = binding_name
         self._family = artifact_family
+        self._count_threshold = count_threshold
 
     async def reconcile(self, after_scope_id: str | None, limit: int, *, fence: ArtifactProcessingFence) -> str | None:
         heads = SOURCE_JOURNAL_HEADS_TABLE
@@ -68,9 +76,18 @@ class SourceProcessingPendingProvider:
             cursors = SourceCursorRepository()
             for scope, high in rows:
                 cursor = await cursors.load(connection, scope, self._binding)
-                if int(high) <= (0 if cursor is None else cursor.cursor.sequence):
+                after = 0 if cursor is None else cursor.cursor.sequence
+                if int(high) <= after:
                     continue
                 intent = await intents.load(connection, scope, self._binding, for_update=True)
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
+                await request_count_triggered_processing(
+                    connection,
+                    scope,
+                    self._binding,
+                    self._count_threshold,
+                    after=after,
+                    intent=intent,
+                )
         return str(rows[-1][0]) if len(rows) == limit else None

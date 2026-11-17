@@ -80,6 +80,7 @@ _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
+_COUNT_RECONCILE_SECONDS = 1.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
@@ -114,6 +115,9 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    # A count threshold admits one Family's processing once that many new
+    # Source entries wait behind its cursor, beside the time condition.
+    automatic_count_threshold: int | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -131,6 +135,7 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        _require_count_threshold(self.automatic_count_threshold)
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -397,6 +402,7 @@ class _FamilyState:
     scan_in_progress: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
+    count_reconcile_at: float = 0.0
     notification_at_start: int = 0
     discovery_pending: bool = True
     next_schedule_at: float | None = None
@@ -585,6 +591,7 @@ class ArtifactProcessingSupervisor:
             state.discovery_pending = True
             state.reconcile_complete = False
             state.reconcile_after = None
+            state.count_reconcile_at = 0.0
         if self._lease_mode == "oceanbase":
             self._renew_task = asyncio.create_task(self._renew(), name=f"artifact-lease-{self._supervisor_group}")
 
@@ -613,6 +620,12 @@ class ArtifactProcessingSupervisor:
             if self._fence is None or self._lease_lost:
                 raise ArtifactProcessingLeadershipLostError(self._supervisor_group, self.holder_id, 0)
             now = asyncio.get_running_loop().time()
+            if state.binding.automatic_count_threshold is not None and now >= state.count_reconcile_at:
+                # A count condition reads the journal on its own clock: its
+                # durable request may appear between two discovery passes.
+                state.count_reconcile_at = now + _COUNT_RECONCILE_SECONDS
+                state.reconcile_complete = False
+                state.reconcile_after = None
             # Reserve fresh admission before retries can occupy a newly freed
             # Worker. FIFO ready order then shares execution between channels.
             discoverable = (
@@ -648,6 +661,10 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        if binding.automatic_count_threshold is not None:
+            # The count condition writes its own durable request, so this
+            # channel stays open without an in-process notification.
+            state.discovery_pending = True
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -1093,6 +1110,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.automatic_count_threshold is not None:
+                deadlines.append(max(now, state.count_reconcile_at))
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
@@ -1132,6 +1151,13 @@ class ArtifactProcessingSupervisor:
                 else type(error).__name__,
             },
         )
+
+
+def _require_count_threshold(value: int | None) -> None:
+    """Accept one optional strict positive integer count threshold."""
+
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError("automatic count threshold must be a positive integer")  # noqa: TRY003
 
 
 def _schedule_deadline(
