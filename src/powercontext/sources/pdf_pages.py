@@ -59,7 +59,115 @@ PDF_SEARCH_HEADING_CHARS: Final = 60
 PDF_SEARCH_HEADING_SPAN: Final = 3
 PDF_SEARCH_HEADING_LINES: Final = 4
 PDF_SEARCH_WEIGHT_WINDOW: Final = 1.0
-PDF_SEARCH_WEIGHT_HEADING: Final = 0.5
+PDF_SEARCH_WEIGHT_HEADING: Final = 1.0
+PDF_SEARCH_WEIGHT_STATEMENT: Final = 3.0
+
+# The statement or section a question asks about, and the words that name it in the
+# document. A question about the quick ratio is answered by the balance sheet and a
+# question about the operating margin by the income statement, so the words of that
+# statement are searched as well.
+_PDF_INTENT_QUERIES: Final = {
+    "income": "consolidated statements of income revenues expenses",
+    "balance": "consolidated balance sheets assets liabilities",
+    "cashflow": "consolidated statements of cash flows operating investing financing",
+    "md&a": "management discussion analysis results of operations",
+    "business": "business segment products customers",
+    "legal": "legal proceedings litigation",
+}
+_PDF_INTENT_TERMS: Final = {
+    "income": (
+        "margin",
+        "margins",
+        "profit",
+        "loss",
+        "eps",
+        "earnings",
+        "tax",
+        "revenue",
+        "revenues",
+        "sales",
+        "cogs",
+        "costs",
+        "expense",
+        "expenses",
+        "income",
+    ),
+    "balance": (
+        "assets",
+        "liabilities",
+        "balance",
+        "sheet",
+        "inventory",
+        "inventories",
+        "receivable",
+        "receivables",
+        "payable",
+        "payables",
+        "liquidity",
+        "ratio",
+        "working",
+        "equity",
+        "book",
+        "capitalization",
+        "debt",
+        "goodwill",
+        "intangible",
+        "deferred",
+    ),
+    "cashflow": (
+        "cash",
+        "flow",
+        "flows",
+        "capex",
+        "expenditure",
+        "depreciation",
+        "amortization",
+        "dividend",
+        "dividends",
+        "buyback",
+        "repurchase",
+        "proceeds",
+        "activities",
+    ),
+    "md&a": ("drove", "driver", "drivers", "caused", "trend", "results", "comparison", "compared", "outlook"),
+    "business": (
+        "geographies",
+        "geographic",
+        "region",
+        "regions",
+        "customer",
+        "customers",
+        "product",
+        "products",
+        "service",
+        "services",
+        "industry",
+        "industries",
+        "employee",
+        "employees",
+        "competition",
+        "competitor",
+        "concentration",
+        "segment",
+        "segments",
+        "supplier",
+        "suppliers",
+    ),
+    "legal": ("legal", "litigation", "lawsuit", "lawsuits", "battle", "battles", "investigation", "settlement"),
+}
+
+# The statement or section a page belongs to, taken from its heading.
+_PDF_STATEMENT_HEADINGS: Final = (
+    ("cashflow", ("statements of cash flow", "statement of cash flow")),
+    ("balance", ("balance sheets", "balance sheet")),
+    ("income", ("statements of income", "statement of income", "statements of operations", "income statement")),
+    ("equity", ("statements of equity",)),
+    ("md&a", ("management's discussion and analysis", "management\u2019s discussion and analysis")),
+    ("geographic", ("geographic",)),
+    ("segment", ("segment",)),
+    ("legal", ("legal proceedings", "legal matters")),
+    ("business", ("item 1. business", "item 1 business", "business environment")),
+)
 
 # Wording of the statement or section that answers a question about it.
 _PDF_SECTION_EXPANSIONS: Final = {
@@ -354,12 +462,28 @@ def _strip_instructions(question: str) -> str:
     return " ".join(kept).strip() or question
 
 
+def _question_intent(question: str) -> str | None:
+    """Detect the statement or section a question asks about."""
+
+    core = _strip_instructions(question)
+    terms = set(_analysis_terms(core))
+    best: str | None = None
+    best_count = 0
+    for name, keywords in _PDF_INTENT_TERMS.items():
+        count = len(terms & set(keywords))
+        if count > best_count:
+            best = name
+            best_count = count
+    return best
+
+
 def _query_variants(question: str) -> tuple[tuple[str, int], ...]:
     """Build the offline query variants that widen the candidate pool.
 
     A single term query returns many pages and its hit count tells how common the
     term is inside the document, so those queries ask for more pages than the
-    others.
+    others. The words that name the statement the question asks about are searched
+    as well, because that page can hold none of the question words.
     """
 
     terms = _content_terms(question)
@@ -370,6 +494,9 @@ def _query_variants(question: str) -> tuple[tuple[str, int], ...]:
         *[(term, PDF_SEARCH_FREQUENCY_LIMIT) for term in terms[:PDF_SEARCH_TERM_LIMIT]],
         *[(phrase, PDF_SEARCH_MAX_POOL_LIMIT) for phrase in phrases[:PDF_SEARCH_PHRASE_LIMIT]],
     ]
+    intent = _question_intent(question)
+    if intent is not None:
+        variants.append((_PDF_INTENT_QUERIES[intent], PDF_SEARCH_MAX_POOL_LIMIT))
     return tuple(dict.fromkeys(variants))
 
 
@@ -437,10 +564,21 @@ def _weights(frequency: dict[str, int], total: int) -> dict[str, float]:
     return weights
 
 
+def _statement_type(lines: list[tuple[int, list[str]]]) -> str | None:
+    """Detect the statement or section a page belongs to from its heading."""
+
+    head = " ".join(token for _, tokens in lines[:6] for token in tokens).casefold()
+    for name, phrases in _PDF_STATEMENT_HEADINGS:
+        if any(phrase in head for phrase in phrases):
+            return name
+    return None
+
+
 def _score_pages(
     texts: dict[str, str],
     terms: frozenset[str],
     hits: dict[str, int],
+    intent: str | None,
 ) -> dict[str, float]:
     """Score every candidate page by the rarity of the question terms it carries."""
 
@@ -456,7 +594,10 @@ def _score_pages(
         window_score = sum(weights.get(term, 0.0) for term in window)
         headings = _heading_terms(lines)
         heading_score = sum(section_weights.get(term, 0.0) for term in section if term in headings)
-        scores[entry_id] = PDF_SEARCH_WEIGHT_WINDOW * window_score + PDF_SEARCH_WEIGHT_HEADING * heading_score
+        score = PDF_SEARCH_WEIGHT_WINDOW * window_score + PDF_SEARCH_WEIGHT_HEADING * heading_score
+        if intent is not None and _statement_type(lines) == intent:
+            score += PDF_SEARCH_WEIGHT_STATEMENT
+        scores[entry_id] = score
     return scores
 
 
@@ -526,7 +667,12 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
     hits, best_rank, counts = await _collect_hits(memory, _query_variants(question), pool_limit)
     if not hits:
         return ()
-    scores = _score_pages({entry_id: hit.text for entry_id, hit in hits.items()}, terms, counts)
+    scores = _score_pages(
+        {entry_id: hit.text for entry_id, hit in hits.items()},
+        terms,
+        counts,
+        _question_intent(question),
+    )
     ranked = sorted(
         hits.values(),
         key=lambda hit: (
