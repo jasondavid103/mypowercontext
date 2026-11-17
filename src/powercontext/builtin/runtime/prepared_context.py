@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -46,6 +48,128 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+_FRAGMENT_NEIGHBOUR_WEIGHT = 0.5
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
+_EVIDENCE_HEADERS = (
+    "background",
+    "objective",
+    "design",
+    "setting",
+    "participants",
+    "intervention",
+    "measurements",
+    "main outcome",
+    "results",
+    "conclusions",
+    "conclusion",
+    "findings",
+    "methods",
+    "purpose",
+    "summary",
+    "significance",
+    "importance",
+)
+_EVIDENCE_STOPWORDS = frozenset({
+    "a",
+    "an",
+    "the",
+    "of",
+    "to",
+    "in",
+    "for",
+    "with",
+    "on",
+    "at",
+    "by",
+    "is",
+    "are",
+    "was",
+    "were",
+    "and",
+    "or",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "as",
+    "be",
+    "been",
+    "being",
+    "has",
+    "have",
+    "had",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "can",
+    "may",
+    "not",
+    "no",
+    "than",
+    "then",
+    "there",
+    "which",
+    "who",
+    "but",
+    "if",
+    "so",
+    "such",
+    "also",
+    "more",
+    "most",
+    "other",
+    "into",
+    "over",
+    "under",
+    "about",
+    "after",
+    "before",
+    "between",
+    "during",
+    "both",
+    "each",
+    "any",
+    "all",
+    "one",
+    "two",
+    "new",
+    "use",
+    "used",
+    "using",
+    "show",
+    "shown",
+    "showed",
+    "found",
+    "find",
+    "them",
+    "because",
+    "while",
+    "when",
+    "where",
+    "we",
+    "our",
+    "their",
+    "they",
+    "from",
+})
+_EVIDENCE_WEIGHTS = {
+    "idf": 0.5,
+    "distinct": 2.0,
+    "rare": 1.0,
+    "quantity": 4.0,
+    "heading": 1.0,
+    "depth": 4.0,
+    "length": 4.0,
+    "density": 0.25,
+    "neighbour": _FRAGMENT_NEIGHBOUR_WEIGHT,
+}
+_EVIDENCE_LEAD_PENALTY = 0.5
+_EVIDENCE_HIT_DECAY = 0.6
 _Item = TypeVar("_Item")
 
 
@@ -106,6 +230,21 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal span of a Memory entry that answers the current query.
+
+    ``text`` is always ``entry.text[start:end]``: the fragment quotes the original
+    entry and never rewrites, translates or summarises it.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -228,6 +367,13 @@ class PreparedContextBuilder:
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
 
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
@@ -254,6 +400,52 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select the literal spans of the Memory entries that answer the query.
+
+        Every fragment quotes the original entry, so a caller can walk from the
+        fragment back to the entry and to the exact characters it carries.
+        """
+
+        entries: list[tuple[str, MemoryHit, float]] = []
+        for group in memory_candidates:
+            scope_id = group.scope_id or current_scope_id or ""
+            for rank, hit in enumerate(group.hits):
+                if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                    continue
+                # Retrieval already ranked the candidates, so a lower ranked entry keeps
+                # less of the budget unless it clearly answers the query on its own.
+                entries.append((scope_id, hit, _EVIDENCE_HIT_DECAY**rank))
+        terms = _query_terms(request.query)
+        candidates: list[tuple[float, int, int, PreparedContextFragment]] = []
+        for order, (scope_id, hit, weight) in enumerate(entries):
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            for score, start, end in _evidence_scores(hit.text, terms):
+                fragment = PreparedContextFragment(address=address, start=start, end=end, text=hit.text[start:end])
+                candidates.append((score * weight, order, start, fragment))
+        selected = _fit_fragments(request.max_bytes, candidates)
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content = _render_fragments(selected)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in selected),
+            fragments=selected,
         )
 
     def probe_budget(
@@ -722,6 +914,177 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
 
 def _rendered_bytes(entries: Sequence[_PreparedContextEntry]) -> int:
     return len(_render(entries).encode("utf-8"))
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    """Return the distinct terms of one query."""
+
+    terms = re.findall(r"[0-9A-Za-z]+|[^\W\d_]+", query.casefold())
+    return tuple(dict.fromkeys(term for term in terms if len(term) > 1 or term.isdigit()))
+
+
+def _term_occurs(text: str, term: str) -> bool:
+    """Report whether one term occurs in the text as a whole word."""
+
+    if term.isascii():
+        return re.search(rf"(?<![0-9A-Za-z]){re.escape(term)}(?![0-9A-Za-z])", text) is not None
+    return term in text
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Split one entry into the sentence spans that carry its wording."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _SENTENCE_BOUNDARY.finditer(text):
+        end = match.start()
+        if end > start:
+            spans.append((start, end))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return tuple(spans)
+
+
+def _evidence_scores(text: str, terms: Sequence[str]) -> tuple[tuple[float, int, int], ...]:
+    """Score every sentence of one entry against the query.
+
+    The signals are the ones a reader of one document uses to find the passage
+    that answers a question: how much rare claim wording the sentence carries,
+    how many different claim terms it covers, how much of it is quantitative,
+    whether it opens a findings section, how far into the entry it sits, and
+    how much its neighbours support it.
+    """
+
+    spans = _sentence_spans(text)
+    if not spans:
+        return ()
+    units = [text[start:end].casefold() for start, end in spans]
+    content = [term for term in terms if term not in _EVIDENCE_STOPWORDS] or list(terms)
+    total = len(units)
+    frequency = {term: sum(1 for unit in units if _term_occurs(unit, term)) for term in content}
+    weights = {term: math.log(1 + total / max(frequency[term], 1)) for term in content}
+    base = [sum(weights[term] for term in content if _term_occurs(unit, term)) for unit in units]
+    last = max(total - 1, 1)
+    scored: list[tuple[float, int, int]] = []
+    for index, unit in enumerate(units):
+        matched = [term for term in content if _term_occurs(unit, term)]
+        distinct = float(len(matched))
+        neighbour = 0.0
+        if index > 0:
+            neighbour = max(neighbour, base[index - 1])
+        if index + 1 < total:
+            neighbour = max(neighbour, base[index + 1])
+        words = len(unit.split())
+        signals = {
+            "idf": sum(weights[term] for term in matched),
+            "distinct": distinct,
+            "rare": sum(weights[term] for term in matched if frequency[term] == 1),
+            "quantity": 1.0 if any(character.isdigit() for character in unit) else 0.0,
+            "heading": 1.0 if any(unit.startswith(name) for name in _EVIDENCE_HEADERS) else 0.0,
+            "depth": index / last,
+            "length": min(words, 80) / 80,
+            "density": distinct / (1 + math.log(1 + words / 20)),
+            "neighbour": neighbour,
+        }
+        score = sum(_EVIDENCE_WEIGHTS[name] * value for name, value in signals.items())
+        if index == 0:
+            # The leading segment of an entry is usually a title that repeats the subject
+            # of the entry, so it answers a question less often than the body does.
+            score *= _EVIDENCE_LEAD_PENALTY
+        if score > 0:
+            scored.append((score, spans[index][0], spans[index][1]))
+    return tuple(scored)
+
+
+def _fragment_item(fragment: PreparedContextFragment) -> dict[str, object]:
+    """Render one fragment as the item of the prepared context envelope."""
+
+    return {
+        "citation": {
+            "scope_id": fragment.address.memory.scope_id,
+            "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+            "entry_id": fragment.address.entry_id,
+            "entry_version_id": fragment.address.entry_version_id,
+        },
+        "content": fragment.text,
+        "start": fragment.start,
+        "end": fragment.end,
+    }
+
+
+def _render_fragments(fragments: Sequence[PreparedContextFragment]) -> str:
+    """Render the selected fragments inside the prepared context envelope."""
+
+    envelope = {
+        "trust": "untrusted_history",
+        "items": [_fragment_item(fragment) for fragment in fragments],
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+_EMPTY_FRAGMENT_BYTES = len(_render_fragments(()).encode("utf-8"))
+
+
+def _fit_fragments(
+    max_bytes: int,
+    candidates: Sequence[tuple[float, int, int, PreparedContextFragment]],
+) -> tuple[PreparedContextFragment, ...]:
+    """Keep the fragments that answer the query best and still fit the byte budget.
+
+    The budget covers the whole output, so the envelope, the citations and the
+    fragment text all count against it. One citation costs about as much as a
+    whole sentence of evidence, so fragments that touch inside one entry are
+    merged into one fragment before the budget is spent.
+    """
+
+    ordered = sorted(candidates, key=lambda candidate: (-candidate[0], candidate[1], candidate[2]))
+    selected: list[tuple[float, int, int, PreparedContextFragment]] = []
+    for candidate in ordered:
+        trial = [*selected, candidate]
+        if _rendered_fragments_bytes(_merge_fragments(trial)) > max_bytes:
+            continue
+        selected = trial
+    return _merge_fragments(selected)
+
+
+def _merge_fragments(
+    candidates: Sequence[tuple[float, int, int, PreparedContextFragment]],
+) -> tuple[PreparedContextFragment, ...]:
+    """Join the fragments that touch inside one entry into one fragment.
+
+    Merging keeps the quoted text literal: two neighbouring spans of one entry
+    are one longer span of the same entry, so every merged fragment still
+    quotes ``entry.text[start:end]`` exactly.
+    """
+
+    grouped: list[list] = []
+    for _, order, _, fragment in sorted(candidates, key=lambda candidate: (candidate[1], candidate[2])):
+        if grouped and grouped[-1][0] == order and grouped[-1][2] == fragment.start:
+            grouped[-1][2] = fragment.end
+            grouped[-1][3] += fragment.text
+            continue
+        if grouped and grouped[-1][0] == order and grouped[-1][1] == fragment.end:
+            grouped[-1][1] = fragment.start
+            grouped[-1][3] = fragment.text + grouped[-1][3]
+            continue
+        grouped.append([order, fragment.start, fragment.end, fragment.text, fragment.address])
+    return tuple(
+        PreparedContextFragment(address=address, start=start, end=end, text=text)
+        for _, start, end, text, address in grouped
+    )
+
+
+def _rendered_fragments_bytes(fragments: Sequence[PreparedContextFragment]) -> int:
+    """Report the UTF-8 size of the output that carries these fragments."""
+
+    size = _EMPTY_FRAGMENT_BYTES
+    for index, fragment in enumerate(fragments):
+        size += len(json.dumps(_fragment_item(fragment), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if index:
+            size += 1
+    return size
 
 
 def _truncate_utf8(text: str, byte_budget: int) -> str:
