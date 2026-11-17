@@ -166,6 +166,11 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
+from powercontext.builtin.runtime.context_pack import (
+    CONTEXT_PACK_CONTEXT_CHUNK_BYTES,
+    ContextPack,
+    ContextPackDelta,
+)
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -846,6 +851,28 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        /,
+        *,
+        base_pack: ContextPack | None = None,
+        authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare the context of one turn as a pack or as the delta to a known pack.
+
+        The first call of a conversation returns the complete pack. Every later
+        call receives the pack the client still owns and returns only the chunks
+        that the client has to append, so the receiver rebuilds the same context
+        without receiving the bytes it already holds.
+        """
+
+        context = await self.prepare(request, authorize_scopes=authorize_scopes)
+        pack = ContextPack.from_content(context.content or "", chunk_bytes=CONTEXT_PACK_CONTEXT_CHUNK_BYTES)
+        if base_pack is None:
+            return pack
+        return ContextPackDelta.between(base_pack, pack)
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
