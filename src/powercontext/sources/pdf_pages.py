@@ -71,6 +71,7 @@ _PDF_INTENT_QUERIES: Final = {
     "balance": "consolidated balance sheets assets liabilities",
     "cashflow": "consolidated statements of cash flows operating investing financing",
     "md&a": "management discussion analysis results of operations",
+    "geographic": "geographic operations revenues by region",
     "business": "business segment products customers",
     "legal": "legal proceedings litigation",
 }
@@ -130,11 +131,18 @@ _PDF_INTENT_TERMS: Final = {
         "activities",
     ),
     "md&a": ("drove", "driver", "drivers", "caused", "trend", "results", "comparison", "compared", "outlook"),
-    "business": (
+    "geographic": (
         "geographies",
         "geographic",
+        "geographical",
         "region",
         "regions",
+        "territory",
+        "territories",
+        "country",
+        "countries",
+    ),
+    "business": (
         "customer",
         "customers",
         "product",
