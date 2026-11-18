@@ -110,3 +110,36 @@ def test_search_uses_several_query_variants_and_returns_distinct_pages() -> None
     assert len(ordered) == 3
     assert len(set(ordered)) == 3
     assert len(memory.queries) > 1
+
+
+def test_an_inflected_form_of_the_question_word_reaches_the_page() -> None:
+    pages = {
+        "entry-1": "ITEM 1A. RISK FACTORS\nThe airline industry has been cyclical and very competitive.",
+        "entry-2": "MANAGEMENT'S DISCUSSION AND ANALYSIS\nOperating margin improved because costs fell.",
+    }
+    memory = _FakeMemory(pages)
+    ordered = _search(memory, "Is the business of the company subject to cyclicality?")
+    assert ordered[0] == "entry-1"
+
+
+def test_a_page_that_words_the_question_differently_is_still_reachable() -> None:
+    pages = {
+        "entry-1": (
+            "FORWARD-LOOKING STATEMENTS\n"
+            "We derive a significant portion of our revenues from a limited number of commercial airlines."
+        ),
+        "entry-2": "MANAGEMENT'S DISCUSSION AND ANALYSIS\nOperating margin improved because costs fell.",
+    }
+    memory = _FakeMemory(pages)
+    ordered = _search(memory, "Who are the primary customers of the company?")
+    assert ordered[0] == "entry-1"
+
+
+def test_a_financial_question_surfaces_the_primary_statement() -> None:
+    pages = {
+        "entry-1": "CONSOLIDATED STATEMENTS OF CASH FLOWS\n2022\nNet cash provided by operating activities",
+        "entry-2": "MANAGEMENT'S DISCUSSION AND ANALYSIS\nNet sales grew during 2022.",
+    }
+    memory = _FakeMemory(pages)
+    ordered = _search(memory, "What is the capital expenditure of the company in 2022?")
+    assert ordered[0] == "entry-1"

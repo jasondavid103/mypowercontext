@@ -20,6 +20,7 @@ import hashlib
 import math
 import re
 import unicodedata
+from collections import Counter
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import quote
@@ -50,7 +51,7 @@ PDF_PAGE_EMPTY_TEXT: Final = ""
 # are statement pages that carry no question word at all, so the question words are also
 # expanded with the wording of the matching statement and looked for in the page
 # headings.
-PDF_SEARCH_POOL_LIMIT: Final = 20
+PDF_SEARCH_POOL_LIMIT: Final = 50
 PDF_SEARCH_MAX_POOL_LIMIT: Final = 50
 PDF_SEARCH_TERM_LIMIT: Final = 10
 PDF_SEARCH_PHRASE_LIMIT: Final = 8
@@ -61,6 +62,15 @@ PDF_SEARCH_HEADING_LINES: Final = 4
 PDF_SEARCH_WEIGHT_WINDOW: Final = 1.0
 PDF_SEARCH_WEIGHT_HEADING: Final = 1.0
 PDF_SEARCH_WEIGHT_STATEMENT: Final = 3.0
+PDF_SEARCH_WEIGHT_LEXICAL: Final = 0.1
+PDF_SEARCH_WEIGHT_SYNONYM: Final = 0.6
+PDF_SEARCH_WEIGHT_ANCHOR: Final = 1.0
+PDF_SEARCH_WEIGHT_CONDITIONAL: Final = 3.0
+PDF_SEARCH_TITLE_LINES: Final = 8
+PDF_SEARCH_HEADER_LINES: Final = 6
+PDF_SEARCH_MINIMUM_STEM: Final = 4
+PDF_SEARCH_MINIMUM_PREFIX: Final = 5
+_PDF_FISCAL_PATTERN: Final = re.compile(r"fy\d{2,4}")
 
 # The statement or section a question asks about, and the words that name it in the
 # document. A question about the quick ratio is answered by the balance sheet and a
@@ -164,17 +174,19 @@ _PDF_INTENT_TERMS: Final = {
     "legal": ("legal", "litigation", "lawsuit", "lawsuits", "battle", "battles", "investigation", "settlement"),
 }
 
-# The statement or section a page belongs to, taken from its heading.
+# The statement or section a page belongs to, taken from its heading. The
+# phrases are matched against the analyzed terms of the heading, so they are
+# written the way the Analyzer splits the heading into terms.
 _PDF_STATEMENT_HEADINGS: Final = (
     ("cashflow", ("statements of cash flow", "statement of cash flow")),
     ("balance", ("balance sheets", "balance sheet")),
     ("income", ("statements of income", "statement of income", "statements of operations", "income statement")),
     ("equity", ("statements of equity",)),
-    ("md&a", ("management's discussion and analysis", "management\u2019s discussion and analysis")),
+    ("md&a", ("management s discussion and analysis",)),
     ("geographic", ("geographic",)),
     ("segment", ("segment",)),
     ("legal", ("legal proceedings", "legal matters")),
-    ("business", ("item 1. business", "item 1 business", "business environment")),
+    ("business", ("item 1 business", "business environment")),
 )
 
 # Wording of the statement or section that answers a question about it.
@@ -216,6 +228,179 @@ _PDF_SECTION_EXPANSIONS: Final = {
 }
 
 _PDF_WORD_PATTERN: Final = re.compile(r"[^\W]+", re.UNICODE)
+_PDF_TOKEN_PATTERN: Final = re.compile(r"[a-z]+|\d+")
+
+# Suffixes that turn one word into a prefix shared with its inflected forms.
+_PDF_STEM_SUFFIXES: Final = (
+    "ities",
+    "ity",
+    "ies",
+    "ied",
+    "ing",
+    "ed",
+    "ions",
+    "ion",
+    "ments",
+    "ment",
+    "ances",
+    "ance",
+)
+
+# Words a question uses for a concept the document words differently. The
+# groups are a general thesaurus: a question about the primary customers of a
+# company is answered by a page that calls them a significant portion of the
+# revenues, so the two wordings have to reach the same page.
+_PDF_SYNONYM_GROUPS: Final = (
+    ("primary", "principal", "main", "largest", "significant", "substantial", "major"),
+    ("customer", "client", "consumer", "buyer"),
+    ("revenue", "sales", "turnover"),
+    ("profit", "earnings", "income"),
+    ("expense", "cost", "expenditure"),
+    ("debt", "borrowings", "indebtedness"),
+    ("asset", "property"),
+    ("growth", "increase", "rise", "expansion"),
+    ("decline", "decrease", "reduction", "fall"),
+    ("liquidity", "cash"),
+    ("segment", "division"),
+    ("acquisition", "merger", "purchase"),
+    ("restructuring", "reorganization"),
+    ("concentration", "reliance", "dependence"),
+    ("margin", "ratio", "percentage"),
+    ("capital", "asset", "property"),
+    ("competition", "competitive"),
+    ("product", "products", "offering"),
+    ("service", "services"),
+)
+
+# The titles an annual report prints for its primary financial statements.
+_PDF_PRIMARY_TITLES: Final = (
+    "consolidated statement of income",
+    "consolidated statements of income",
+    "consolidated statement of operations",
+    "consolidated statements of operations",
+    "consolidated balance sheet",
+    "consolidated balance sheets",
+    "consolidated statement of cash flows",
+    "consolidated statements of cash flows",
+    "consolidated statement of equity",
+    "consolidated statements of equity",
+    "consolidated statement of comprehensive income",
+    "consolidated statements of comprehensive income",
+)
+
+# The statement or section a question is answered by. The triggers select the
+# group from the question, the titles are what the document prints for it.
+_PDF_ANCHOR_GROUPS: Final = {
+    "balance": {
+        "triggers": (
+            "balance sheet",
+            "liquidity",
+            "quick ratio",
+            "current ratio",
+            "working capital",
+            "book value",
+            "leverage",
+            "net debt",
+            "receivable",
+            "payable",
+            "inventory",
+            "goodwill",
+            "intangible",
+            "assets",
+            "liabilities",
+            "capital",
+        ),
+        "titles": ("balance sheet", "balance sheets"),
+    },
+    "income": {
+        "triggers": (
+            "income statement",
+            "p&l",
+            "profit and loss",
+            "gross margin",
+            "operating margin",
+            "net margin",
+            "ebitda",
+            "revenue",
+            "cost of goods sold",
+            "cogs",
+            "profit",
+            "earnings",
+            "eps",
+            "operating income",
+            "net income",
+            "tax rate",
+            "sales",
+        ),
+        "titles": (
+            "statements of income",
+            "statement of income",
+            "statements of operations",
+            "statement of operations",
+            "income statement",
+        ),
+    },
+    "cashflow": {
+        "triggers": (
+            "cash flow",
+            "capex",
+            "capital expenditure",
+            "capital intensive",
+            "free cash flow",
+            "dividend",
+            "buyback",
+            "repurchase",
+            "operating activities",
+            "investing activities",
+            "financing activities",
+            "depreciation",
+            "amortization",
+        ),
+        "titles": (
+            "statements of cash flows",
+            "statement of cash flows",
+            "statements of cash flow",
+        ),
+    },
+    "segment": {
+        "triggers": (
+            "segment",
+            "reporting segment",
+            "business segment",
+            "product category",
+            "service category",
+            "revenue by",
+        ),
+        "titles": ("segment data", "segment information", "segment reporting", "business segment"),
+    },
+    "legal": {
+        "triggers": ("legal", "litigation", "lawsuit", "contingenc", "battle"),
+        "titles": ("legal proceedings", "legal matters", "commitments and contingencies"),
+    },
+    "geographic": {
+        "triggers": ("geograph", "region", "territor", "country", "countries", "operate in"),
+        "titles": ("geographic", "item 1. business", "item 1 business", "business"),
+    },
+    "restructuring": {
+        "triggers": ("restructuring", "impairment", "productivity plan"),
+        "titles": ("restructuring", "impairment"),
+    },
+    "acquisition": {
+        "triggers": ("acquisition", "acquired", "business combination", "merger", "divestiture"),
+        "titles": ("acquisition", "business combination", "divestiture"),
+    },
+    "concentration": {
+        "triggers": ("customer concentration", "concentration", "largest customer"),
+        "titles": ("concentration", "significant customer"),
+    },
+    "business": {
+        "triggers": ("major products", "products and services", "industry", "operate in", "business"),
+        "titles": ("item 1. business", "item 1 business", "our business", "business"),
+    },
+}
+
+# The statement groups whose pages a financial question is answered by.
+_PDF_STATEMENT_GROUPS: Final = ("balance", "income", "cashflow")
 _PDF_FUNCTION_WORDS: Final = frozenset([
     "a",
     "an",
@@ -582,30 +767,206 @@ def _statement_type(lines: list[tuple[int, list[str]]]) -> str | None:
     return None
 
 
+def _stem(term: str) -> str:
+    """Reduce one term to a prefix that its inflected forms share."""
+
+    for suffix in _PDF_STEM_SUFFIXES:
+        if term.endswith(suffix) and len(term) - len(suffix) >= PDF_SEARCH_MINIMUM_STEM:
+            return term[: -len(suffix)]
+    if term.endswith("sses") and len(term) >= 6:
+        return term[:-2]
+    if term.endswith("s") and not term.endswith("ss") and len(term) >= PDF_SEARCH_MINIMUM_STEM:
+        return term[:-1]
+    return term
+
+
+def _fiscal_variants(term: str) -> tuple[str, ...]:
+    """Turn a fiscal-year label into the plain year the document prints."""
+
+    if _PDF_FISCAL_PATTERN.fullmatch(term):
+        return (term[2:],)
+    return ()
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    """Return the searchable terms of one question, stems and fiscal years included."""
+
+    terms: list[str] = []
+    for term in _content_terms(question):
+        for candidate in (term, _stem(term), *_fiscal_variants(term)):
+            if candidate and candidate not in terms:
+                terms.append(candidate)
+    return tuple(terms)
+
+
+def _synonym_terms(terms: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the question terms with the general synonym partners included."""
+
+    result = list(terms)
+    for group in _PDF_SYNONYM_GROUPS:
+        if len([term for term in group if term in terms]) != 1:
+            continue
+        for member in group:
+            if member not in result:
+                result.append(member)
+    return tuple(result)
+
+
+def _page_tokens(text: str) -> set[str]:
+    """Return the lowercase word and number tokens one page carries."""
+
+    return set(_PDF_TOKEN_PATTERN.findall(text.lower()))
+
+
+def _token_prefixes(tokens: set[str]) -> set[str]:
+    """Return the prefixes one page carries, so a stem can match a longer word."""
+
+    found: set[str] = set()
+    for token in tokens:
+        for length in range(PDF_SEARCH_MINIMUM_PREFIX, len(token) + 1):
+            found.add(token[:length])
+    return found
+
+
+def _matched_terms(page_tokens: set[str], prefixes: set[str], terms: tuple[str, ...]) -> set[str]:
+    """Return the question terms one page carries, inflected forms included."""
+
+    found: set[str] = set()
+    for term in terms:
+        base = _stem(term)
+        if base in page_tokens or (len(base) >= PDF_SEARCH_MINIMUM_PREFIX and base in prefixes):
+            found.add(term)
+    return found
+
+
+def _document_frequency(
+    page_tokens: list[set[str]], prefixes: list[set[str]], terms: tuple[str, ...]
+) -> dict[str, int]:
+    """Count how many candidate pages carry each question term."""
+
+    frequency: dict[str, int] = {}
+    for tokens, token_prefixes in zip(page_tokens, prefixes, strict=True):
+        for term in _matched_terms(tokens, token_prefixes, terms):
+            frequency[term] = frequency.get(term, 0) + 1
+    return frequency
+
+
+def _idf(frequency: dict[str, int], term: str, total: int) -> float:
+    """Return how rare one term is inside the candidate pool."""
+
+    count = frequency.get(term, 0)
+    if not count:
+        return 0.0
+    return math.log(1 + total / count)
+
+
+def _running_headers(texts: dict[str, str]) -> frozenset[str]:
+    """Return the lines the document repeats at the top of every page."""
+
+    counters: Counter[str] = Counter()
+    for text in texts.values():
+        for line in text.splitlines()[:PDF_SEARCH_HEADER_LINES]:
+            stripped = line.strip().lower()
+            if stripped:
+                counters[stripped] += 1
+    threshold = max(3, len(texts) // 4)
+    return frozenset(line for line, count in counters.items() if count >= threshold)
+
+
+def _title_region(text: str, headers: frozenset[str]) -> str:
+    """Return the leading lines of one page, which carry its title."""
+
+    lines: list[str] = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if index == 0:
+            continue
+        if stripped.lower() in headers:
+            continue
+        lines.append(stripped.lower())
+        if len(lines) >= PDF_SEARCH_TITLE_LINES:
+            break
+    return " ".join(lines)
+
+
+def _anchor_groups(question: str) -> tuple[str, ...]:
+    """Return the statement or section groups a question asks about."""
+
+    lowered = question.lower()
+    return tuple(
+        name for name, spec in _PDF_ANCHOR_GROUPS.items() if any(trigger in lowered for trigger in spec["triggers"])
+    )
+
+
+def _anchor_weight(region: str, groups: tuple[str, ...]) -> float:
+    """Return the anchor weight of one page title for the requested groups."""
+
+    weight = 0.0
+    for name in groups:
+        if any(title in region for title in _PDF_ANCHOR_GROUPS[name]["titles"]):
+            weight += 1.0
+    return weight
+
+
+def _conditional_weight(region: str, groups: tuple[str, ...]) -> float:
+    """Return the weight of a primary statement page for a financial question."""
+
+    if not any(name in groups for name in _PDF_STATEMENT_GROUPS):
+        return 0.0
+    return 1.0 if any(title in region for title in _PDF_PRIMARY_TITLES) else 0.0
+
+
 def _score_pages(
     texts: dict[str, str],
     terms: frozenset[str],
+    narrow_terms: tuple[str, ...],
+    wide_terms: tuple[str, ...],
     hits: dict[str, int],
+    groups: tuple[str, ...],
     intent: str | None,
 ) -> dict[str, float]:
-    """Score every candidate page by the rarity of the question terms it carries."""
+    """Score every candidate page by how well it answers the question.
+
+    A question rarely repeats the wording of the report, so a page is scored on
+    the terms it carries, on the statement or section its title names, and on
+    the way the question words a concept the report words differently.
+    """
 
     total = len(texts)
     section = _section_terms(terms)
     frequency = _term_frequencies(texts, terms | section, hits)
     weights = _weights({term: frequency[term] for term in terms if term in frequency}, total)
     section_weights = _weights({term: frequency[term] for term in section if term in frequency}, total)
+    headers = _running_headers(texts)
+    tokens = [_page_tokens(text) for text in texts.values()]
+    prefixes = [_token_prefixes(values) for values in tokens]
+    document_frequency = _document_frequency(tokens, prefixes, wide_terms)
     scores: dict[str, float] = {}
-    for entry_id, text in texts.items():
+    for index, (entry_id, text) in enumerate(texts.items()):
         lines = _page_lines(text)
         window = _window_terms(lines, terms)
         window_score = sum(weights.get(term, 0.0) for term in window)
         headings = _heading_terms(lines)
         heading_score = sum(section_weights.get(term, 0.0) for term in section if term in headings)
-        score = PDF_SEARCH_WEIGHT_WINDOW * window_score + PDF_SEARCH_WEIGHT_HEADING * heading_score
+        statement_score = 0.0
         if intent is not None and _statement_type(lines) == intent:
-            score += PDF_SEARCH_WEIGHT_STATEMENT
-        scores[entry_id] = score
+            statement_score = PDF_SEARCH_WEIGHT_STATEMENT
+        narrow = _matched_terms(tokens[index], prefixes[index], narrow_terms)
+        broad = _matched_terms(tokens[index], prefixes[index], wide_terms)
+        lexical = sum(_idf(document_frequency, term, total) for term in broad)
+        synonym = sum(_idf(document_frequency, term, total) for term in broad - narrow)
+        region = _title_region(text, headers)
+        scores[entry_id] = (
+            PDF_SEARCH_WEIGHT_WINDOW * window_score
+            + PDF_SEARCH_WEIGHT_HEADING * heading_score
+            + statement_score
+            + PDF_SEARCH_WEIGHT_LEXICAL * lexical
+            + PDF_SEARCH_WEIGHT_SYNONYM * synonym
+            + PDF_SEARCH_WEIGHT_ANCHOR * _anchor_weight(region, groups)
+            + PDF_SEARCH_WEIGHT_CONDITIONAL * _conditional_weight(region, groups)
+        )
     return scores
 
 
@@ -671,6 +1032,9 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
     if not question:
         return ()
     terms = frozenset(_content_terms(question))
+    narrow_terms = _question_terms(question)
+    wide_terms = _synonym_terms(narrow_terms)
+    groups = _anchor_groups(question)
     pool_limit = min(max(limit, PDF_SEARCH_POOL_LIMIT), PDF_SEARCH_MAX_POOL_LIMIT)
     hits, best_rank, counts = await _collect_hits(memory, _query_variants(question), pool_limit)
     if not hits:
@@ -678,7 +1042,10 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
     scores = _score_pages(
         {entry_id: hit.text for entry_id, hit in hits.items()},
         terms,
+        narrow_terms,
+        wide_terms,
         counts,
+        groups,
         _question_intent(question),
     )
     ranked = sorted(
