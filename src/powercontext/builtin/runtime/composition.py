@@ -97,6 +97,7 @@ from powercontext.builtin.persistence.processing_migration import (
     bootstrap_processing_schema,
 )
 from powercontext.builtin.persistence.scope_search_schema import ensure_scope_search_schema
+from powercontext.builtin.persistence.seekdb.memory_index import SeekDBMemoryIndex
 from powercontext.builtin.persistence.seekdb.profile import SeekDBConfig, SeekDBProfile
 from powercontext.builtin.persistence.skill_distribution_schema import ensure_skill_distribution_schema
 from powercontext.builtin.persistence.sqlite.experience_index import SQLiteExperienceFTSIndex
@@ -126,7 +127,13 @@ from powercontext.builtin.runtime.artifact_processing import (
     ArtifactProcessingSupervisors,
     SpawnArtifactProcessingWorkerLauncher,
 )
-from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
+from powercontext.builtin.runtime.config import (
+    BuiltinConfig,
+    DatabaseConfig,
+    ExternalSkillsConfig,
+    InferenceConfig,
+    RuntimeConfig,
+)
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -640,6 +647,7 @@ async def open_builtin_runtime(
                 remote_skill_distribution=contexts.remote_skill_distribution(),
                 statistics_service=contexts.statistics,
                 record_service=contexts.records,
+                lifecycle_repository=contexts.repositories.source_lifecycle,
                 prompt_service=contexts.prompts,
                 recall_token_estimator=contexts.estimate_recall_tokens,
                 recall_effort_sink=recall_effort_sink,
@@ -861,6 +869,21 @@ async def _open_artifact_processing_supervisor(
         yield ArtifactProcessingSupervisors(tuple(supervisors))
 
 
+def _memory_index(database: DatabaseConfig, embedding_model: EmbeddingModel | None) -> MemoryIndex:
+    """Select the Memory candidate index for the configured database.
+
+    seekdb keeps both native indexes in one candidate statement, so a hybrid
+    retrieval plans a single full-text scan and a single vector lookup.
+    """
+
+    if isinstance(database, SeekDBConfig):
+        return SeekDBMemoryIndex(None if embedding_model is None else embedding_model.profile)
+    indexes = [OceanBaseMemoryFTSIndex()]
+    if embedding_model is not None:
+        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
+    return CompositeMemoryIndex(*indexes)
+
+
 @asynccontextmanager
 async def open_builtin_contexts(
     config: BuiltinConfig,
@@ -968,10 +991,7 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    index = _memory_index(database, embedding_model)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
