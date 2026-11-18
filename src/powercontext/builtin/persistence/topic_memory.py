@@ -50,6 +50,7 @@ from powercontext.builtin.artifacts.topic_memory import (
 from powercontext.builtin.artifacts.topic_memory.fusion import _fuse_topic_memory_rankings
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
 from powercontext.builtin.persistence.errors import InvalidRepositoryArgumentError
+from powercontext.builtin.persistence.source_lifecycle import withdrawn_topic_artifact_ids
 from powercontext.builtin.persistence.supervision import database_utc_now
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
@@ -489,9 +490,15 @@ class TopicMemoryRepository:
         channels = await self.index.search(connection, scope_id, request)
         await self._check_retrieval_shape(connection)
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
+        withdrawn = await withdrawn_topic_artifact_ids(connection, scope_id)
+        hits = outcome.hits
+        if withdrawn:
+            # A Topic without remaining support leaves native retrieval and every
+            # Context that reads it, while its exact revision stays readable.
+            hits = tuple(hit for hit in hits if hit.artifact_ref.artifact_id not in withdrawn)
         return TopicMemorySearchResult(
             mode=used_mode,
-            hits=outcome.hits,
+            hits=hits,
             admission=AdmissionCounts(
                 family=TopicMemory.family,
                 scope_id=scope_id,
